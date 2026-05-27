@@ -717,6 +717,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
             @self._client.event
+            async def on_interaction(interaction):
+                await adapter_self._handle_content_os_comment_interaction(interaction)
+
+            @self._client.event
             async def on_message(message: DiscordMessage):
                 # Block until _resolve_allowed_usernames has swapped
                 # any raw usernames in DISCORD_ALLOWED_USERS for numeric
@@ -4025,6 +4029,177 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def _handle_content_os_comment_interaction(self, interaction) -> None:
+        """Handle Content OS comment-action buttons posted to Discord threads.
+
+        These buttons are intentionally scoped to a single custom-id prefix so
+        they don't interfere with Hermes' normal Discord views.  The messages
+        may be sent by repository scripts through Discord REST, so they are not
+        backed by an in-memory discord.ui.View instance.
+        """
+        if not DISCORD_AVAILABLE:
+            return
+        try:
+            data = getattr(interaction, "data", None) or {}
+            custom_id = str(data.get("custom_id") or "")
+        except Exception:
+            return
+        if not custom_id.startswith("contentos_comment:"):
+            return
+
+        allowed, reason = self._evaluate_slash_authorization(interaction)
+        if not allowed:
+            try:
+                await interaction.response.send_message(
+                    f"Not authorized to use this Content OS action ({reason}).",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        parts = custom_id.split(":", 2)
+        if len(parts) != 3:
+            await interaction.response.send_message("Malformed Content OS action.", ephemeral=True)
+            return
+        _, action, notion_page_id = parts
+        notion_page_id = notion_page_id.strip()
+
+        if action == "copy":
+            comment = self._extract_content_os_comment_from_message(getattr(interaction, "message", None))
+            if not comment:
+                await interaction.response.send_message(
+                    "I couldn't find a `Comment:` fenced block on this Discord message.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(comment, ephemeral=True)
+            return
+
+        if action not in {"post", "comment", "commented", "ignore"}:
+            await interaction.response.send_message("Unknown Content OS action.", ephemeral=True)
+            return
+
+        comment = ""
+        if action in {"post", "comment"}:
+            comment = self._extract_content_os_comment_from_message(getattr(interaction, "message", None))
+            if not comment:
+                await interaction.response.send_message(
+                    "I couldn't find a `Comment:` fenced block on this Discord message.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        repo_root = os.getenv("CONTENT_OS_REPO", "/Users/gagik/Projects/content-os")
+        script_action = "mark-commented" if action == "commented" else action
+        if script_action == "comment":
+            script_action = "post"
+        tmp_path = None
+        try:
+            args = [
+                "pnpm",
+                "--filter",
+                "@content-os/automations",
+                "exec",
+                "tsx",
+                "scripts/comment-action.ts",
+                script_action,
+                notion_page_id,
+            ]
+            if script_action == "post":
+                fd, tmp_path = tempfile.mkstemp(prefix="contentos-comment-", suffix=".txt")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(comment)
+                args.extend(["--comment-file", tmp_path, "--confirm-post"])
+
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=repo_root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timeout = 300 if script_action == "post" else 60
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout = stdout_b.decode("utf-8", errors="replace").strip()
+            stderr = stderr_b.decode("utf-8", errors="replace").strip()
+            if proc.returncode != 0:
+                detail = (stderr or stdout or f"exit {proc.returncode}")[-1500:]
+                await interaction.followup.send(
+                    f"Content OS action failed: ```text\n{detail}\n```",
+                    ephemeral=True,
+                )
+                return
+            payload = self._parse_content_os_action_json(stdout)
+            if script_action == "post":
+                try:
+                    await interaction.message.add_reaction("✅")
+                except Exception:
+                    pass
+                url = payload.get("commentUrl") or payload.get("postUrl") or ""
+                external_post_url = payload.get("externalPostUrl") or ""
+                voice_bank_url = payload.get("voiceBankUrl") or ""
+                urn = payload.get("commentUrn") or payload.get("commentId") or ""
+                lines = ["Comment posted and synced."]
+                if url:
+                    lines.append(f"URL: {url}")
+                if external_post_url:
+                    lines.append(f"External Post URL: {external_post_url}")
+                if voice_bank_url:
+                    lines.append(f"Voice Bank URL: {voice_bank_url}")
+                if urn:
+                    lines.append(f"Comment URN: {urn}")
+                await interaction.followup.send("\n".join(lines), ephemeral=True)
+                return
+
+            label = "Marked as commented" if action == "commented" else "Ignored"
+            try:
+                await interaction.message.add_reaction("✅" if action == "commented" else "🗑️")
+            except Exception:
+                pass
+            await interaction.followup.send(f"{label} in Notion.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"Content OS action failed: {exc}", ephemeral=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def _parse_content_os_action_json(self, stdout: str) -> dict:
+        """Parse JSON emitted by Content OS action scripts, tolerating log lines."""
+        text = (stdout or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        start = text.rfind("{")
+        if start >= 0:
+            try:
+                parsed = json.loads(text[start:])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _extract_content_os_comment_from_message(self, message) -> str:
+        """Extract the final comment fenced block from a Content OS artifact."""
+        content = str(getattr(message, "content", "") or "")
+        if not content:
+            return ""
+        match = re.search(
+            r"(?:^|\n)Comment:\s*\n```(?:text)?\s*\n(?P<comment>.*?)\n```",
+            content,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return ""
+        return match.group("comment").replace("\u200b", "").strip()
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,

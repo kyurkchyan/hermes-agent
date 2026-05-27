@@ -484,6 +484,67 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert response.output[0].content[0].text == "streamed create ok"
 
 
+def test_run_codex_stream_falls_back_when_sdk_parse_sees_output_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(final_error=TypeError("'NoneType' object is not iterable"))
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return _FakeCreateStream(
+            [
+                SimpleNamespace(type="response.completed", response=_codex_message_response("recovered")),
+            ]
+        )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls == {"stream": 1, "create": 1}
+    assert response.output[0].content[0].text == "recovered"
+
+
+def test_run_codex_create_stream_fallback_backfills_when_terminal_output_is_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    streamed_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="backfilled item")],
+    )
+    terminal_response = SimpleNamespace(
+        output=None,
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3, total_tokens=8),
+        status="completed",
+        model="gpt-5-codex",
+    )
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.output_item.done", item=streamed_item),
+            SimpleNamespace(type="response.completed", response=terminal_response),
+        ]
+    )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: create_stream,
+        )
+    )
+
+    response = agent._run_codex_create_stream_fallback(_codex_request_kwargs())
+    assert response is not None
+    assert create_stream.closed is True
+    assert response.output == [streamed_item]
+    assert response.output[0].content[0].text == "backfilled item"
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))

@@ -335,6 +335,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             raise
+        except TypeError as exc:
+            # The OpenAI SDK's parse_response (openai/lib/_parsing/_responses.py)
+            # does ``for output in response.output`` without guarding ``output``
+            # against ``None``.  The chatgpt.com/backend-api/codex endpoint
+            # occasionally emits a ``response.completed`` event whose
+            # ``response.output`` field is ``None`` (rather than an empty list),
+            # which surfaces here as ``TypeError: 'NoneType' object is not
+            # iterable``.  Route to the raw ``responses.create(stream=True)``
+            # fallback, which bypasses the SDK's parser and rebuilds the final
+            # response from the per-item SSE events we've already received.
+            err_text = str(exc)
+            if "NoneType" in err_text and "not iterable" in err_text:
+                logger.debug(
+                    "Responses stream parse_response saw output=None; "
+                    "falling back to create(stream=True). %s err=%s",
+                    agent._client_log_context(),
+                    err_text,
+                )
+                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
 
 
 
@@ -412,9 +432,13 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is None and isinstance(event, dict):
                 terminal_response = event.get("response")
             if terminal_response is not None:
-                # Backfill empty output from collected stream events
+                # Backfill empty output from collected stream events.
+                # The chatgpt.com codex backend sometimes emits ``output=None``
+                # on the terminal event after streaming items via
+                # ``response.output_item.done`` — treat that the same as an
+                # empty list so the backfill below kicks in.
                 _out = getattr(terminal_response, "output", None)
-                if isinstance(_out, list) and not _out:
+                if _out is None or (isinstance(_out, list) and not _out):
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)
                         logger.debug(
