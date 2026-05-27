@@ -25,7 +25,7 @@ import { cn } from "@/lib/utils";
  * viewport / overflow ancestors. Below the `sm` breakpoint, `dropUp` uses a
  * bottom sheet portaled to `document.body` instead of an anchored dropdown.
  */
-export function LanguageSwitcher({ dropUp = false }: LanguageSwitcherProps) {
+export function LanguageSwitcher({ collapsed = false, dropUp = false }: LanguageSwitcherProps) {
   const { locale, setLocale, t } = useI18n();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -69,7 +69,10 @@ export function LanguageSwitcher({ dropUp = false }: LanguageSwitcherProps) {
         aria-label={t.language.switchTo}
         aria-haspopup="listbox"
         aria-expanded={open}
-        className="px-2 py-1 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground"
+        className={cn(
+          "px-2 py-1 normal-case tracking-normal font-normal text-xs text-text-secondary hover:text-foreground",
+          collapsed && "hover:bg-transparent",
+        )}
       >
         <span className="inline-flex items-center gap-1.5">
           <Typography
@@ -103,8 +106,10 @@ export function LanguageSwitcher({ dropUp = false }: LanguageSwitcherProps) {
         <div
           aria-label={sheetTitle}
           className={cn(
-            "absolute right-0 z-50 min-w-[10rem] rounded-md border border-border bg-popover shadow-md py-1 max-h-80 overflow-y-auto",
-            dropUp ? "bottom-full mb-1" : "top-full mt-1",
+            "absolute z-50 min-w-[10rem] rounded-md border border-border bg-popover shadow-md py-1 max-h-80 overflow-y-auto",
+            dropUp
+              ? "left-0 bottom-full mb-1"
+              : "right-0 top-full mt-1",
           )}
           role="listbox"
         >
@@ -164,5 +169,6 @@ interface LanguageSwitcherOptionsProps {
 }
 
 interface LanguageSwitcherProps {
+  collapsed?: boolean;
   dropUp?: boolean;
 }
