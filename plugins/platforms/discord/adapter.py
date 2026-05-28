@@ -4031,9 +4031,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
     async def _handle_content_os_comment_interaction(self, interaction) -> None:
-        """Handle Content OS comment-action buttons posted to Discord threads.
+        """Handle Content OS action buttons posted to Discord threads.
 
-        These buttons are intentionally scoped to a single custom-id prefix so
+        These buttons are intentionally scoped to Content OS custom-id prefixes so
         they don't interfere with Hermes' normal Discord views.  The messages
         may be sent by repository scripts through Discord REST, so they are not
         backed by an in-memory discord.ui.View instance.
@@ -4044,6 +4044,9 @@ class DiscordAdapter(BasePlatformAdapter):
             data = getattr(interaction, "data", None) or {}
             custom_id = str(data.get("custom_id") or "")
         except Exception:
+            return
+        if custom_id.startswith("contentos_angle:"):
+            await self._handle_content_os_angle_interaction(interaction, custom_id)
             return
         if not custom_id.startswith("contentos_comment:"):
             return
@@ -4096,6 +4099,10 @@ class DiscordAdapter(BasePlatformAdapter):
         script_action = "mark-commented" if action == "commented" else action
         if script_action == "comment":
             script_action = "post"
+        if script_action == "post":
+            await self._set_content_os_comment_action_buttons(
+                getattr(interaction, "message", None), notion_page_id, "verifying",
+            )
         tmp_path = None
         try:
             args = [
@@ -4127,12 +4134,25 @@ class DiscordAdapter(BasePlatformAdapter):
             if proc.returncode != 0:
                 detail = (stderr or stdout or f"exit {proc.returncode}")[-1500:]
                 await interaction.followup.send(
-                    f"Content OS action failed: ```text\n{detail}\n```",
+                    f"Content OS action failed before a confirmed sync. The Comment button is left in Verifying state to avoid duplicate posts; verify manually before retrying. ```text\n{detail}\n```",
                     ephemeral=True,
                 )
                 return
             payload = self._parse_content_os_action_json(stdout)
+            if script_action == "post" and payload.get("status") == "ambiguous_submitted":
+                try:
+                    await interaction.message.add_reaction("⚠️")
+                except Exception:
+                    pass
+                await interaction.followup.send(
+                    "LinkedIn submission was attempted, but the comment was not visible before verification timed out. The button is left as Verifying to prevent duplicate comments. Please verify read-only/manual before any retry.",
+                    ephemeral=True,
+                )
+                return
             if script_action == "post":
+                await self._set_content_os_comment_action_buttons(
+                    getattr(interaction, "message", None), notion_page_id, "posted",
+                )
                 try:
                     await interaction.message.add_reaction("✅")
                 except Exception:
@@ -4167,6 +4187,269 @@ class DiscordAdapter(BasePlatformAdapter):
                     os.unlink(tmp_path)
                 except Exception:
                     pass
+
+    async def _handle_content_os_angle_interaction(self, interaction, custom_id: str) -> None:
+        """Turn a Content OS angle button click into a post-scoped user turn."""
+        parsed = self._parse_content_os_angle_custom_id(custom_id)
+        if not parsed:
+            try:
+                await interaction.response.send_message("Malformed Content OS angle selection.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        notion_page_id, selected_angle = parsed
+
+        allowed, reason = self._evaluate_slash_authorization(interaction)
+        if not allowed:
+            try:
+                await interaction.response.send_message(
+                    f"Not authorized to use this Content OS action ({reason}).",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        channel = await self._resolve_interaction_channel(interaction)
+        artifact = await self._fetch_content_os_angle_artifact(
+            channel,
+            before=getattr(interaction, "message", None),
+            notion_page_id=notion_page_id,
+        )
+        if not artifact:
+            try:
+                await interaction.response.send_message(
+                    "I couldn't recover exactly which angle artifact this button belongs to. Please reply with the post URL plus angle number so I don't finalize the wrong post.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        prompt = self._build_content_os_angle_selection_prompt(
+            selected_angle=selected_angle,
+            notion_page_id=notion_page_id,
+            artifact=artifact,
+            source="Discord angle button",
+        )
+        try:
+            await interaction.response.send_message(
+                f"Selected angle {selected_angle} for External Post `{notion_page_id}`. I’ll draft the final comment in this thread.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        await self.handle_message(self._build_content_os_interaction_event(interaction, prompt))
+
+    @staticmethod
+    def _parse_content_os_angle_custom_id(custom_id: str) -> Optional[Tuple[str, int]]:
+        match = re.fullmatch(r"contentos_angle:select:([^:]+):([1-5])", str(custom_id or ""))
+        if not match:
+            return None
+        return match.group(1).strip(), int(match.group(2))
+
+    @staticmethod
+    def _compact_content_os_page_id(page_id: str) -> str:
+        return re.sub(r"[^0-9a-fA-F]", "", str(page_id or "")).lower()
+
+    @classmethod
+    def _content_os_text_matches_page(cls, text: str, page_id: str) -> bool:
+        compact = cls._compact_content_os_page_id(page_id)
+        if not compact:
+            return False
+        haystack = re.sub(r"[^0-9a-fA-F]", "", str(text or "")).lower()
+        return compact in haystack
+
+    @staticmethod
+    def _looks_like_content_os_angle_artifact(text: str) -> bool:
+        body = str(text or "")
+        return (
+            "Angles:" in body
+            and re.search(r"(?m)^\s*[1-5]\.\s+", body) is not None
+            and ("Reply with 1-5" in body or "RAG used:" in body or "URL:" in body)
+        )
+
+    @classmethod
+    def _recover_content_os_angle_artifact_from_texts(
+        cls,
+        texts: List[str],
+        notion_page_id: str = "",
+    ) -> str:
+        """Recover the nearest complete angle artifact from chronological Discord text chunks."""
+        chunks = [str(t or "").strip() for t in texts if str(t or "").strip()]
+        if not chunks:
+            return ""
+        joined = "\n\n--- Discord message boundary ---\n\n".join(chunks)
+        summary_starts = [m.start() for m in re.finditer(r"(?m)^Summary:", joined)]
+        starts = summary_starts or [m.start() for m in re.finditer(r"(?m)^Angles:", joined)]
+        candidates: List[str] = []
+        for start in starts:
+            next_summary = joined.find("\nSummary:", start + 1)
+            end = next_summary if next_summary > start else len(joined)
+            candidate = joined[start:end].strip()
+            if cls._looks_like_content_os_angle_artifact(candidate):
+                candidates.append(candidate)
+        if not candidates and cls._looks_like_content_os_angle_artifact(joined):
+            candidates.append(joined.strip())
+        if not candidates:
+            return ""
+        if notion_page_id:
+            matching = [c for c in candidates if cls._content_os_text_matches_page(c, notion_page_id)]
+            return matching[-1] if matching else ""
+        return candidates[-1]
+
+    @staticmethod
+    def _extract_content_os_notion_page_id_from_artifact(artifact: str) -> str:
+        match = re.search(
+            r"(?im)^External Post URL:\s*https?://(?:www\.)?notion\.so/(?:[^\s/]*-)?(?P<id>[0-9a-fA-F]{32})\b",
+            str(artifact or ""),
+        )
+        return match.group("id") if match else ""
+
+    @staticmethod
+    def _extract_content_os_angle_text(artifact: str, selected_angle: int) -> str:
+        match = re.search(
+            rf"(?ms)^\s*{int(selected_angle)}\.\s*(?P<angle>.*?)(?=^\s*[1-5]\.\s+|^\s*Reply with|^\s*URL:|\Z)",
+            str(artifact or ""),
+        )
+        return match.group("angle").strip() if match else ""
+
+    def _build_content_os_angle_selection_prompt(
+        self,
+        *,
+        selected_angle: int,
+        notion_page_id: str,
+        artifact: str,
+        source: str,
+    ) -> str:
+        selected_text = self._extract_content_os_angle_text(artifact, selected_angle)
+        parts = [
+            "[Content OS angle selection]",
+            f"Source: {source}",
+            f"External Posts Notion page ID: {notion_page_id}",
+            f"Selected angle number: {selected_angle}",
+            "This is a post-scoped selection. Bind the final comment to this Notion page / URL and this recovered angle artifact, not merely to the Discord creator thread.",
+        ]
+        if selected_text:
+            parts.extend(["", "Selected angle text:", selected_text])
+        parts.extend([
+            "",
+            "Recovered angle artifact:",
+            "```markdown",
+            artifact.strip(),
+            "```",
+            "",
+            "Continue in Content OS final/polish mode using the selected angle. If this artifact is insufficient to recover exactly one post and one angle, ask for clarification instead of guessing.",
+        ])
+        return "\n".join(parts)
+
+    async def _fetch_content_os_angle_artifact(
+        self,
+        channel: Any,
+        *,
+        before: Any = None,
+        notion_page_id: str = "",
+        limit: int = 25,
+    ) -> str:
+        """Fetch nearby Discord messages and recover the post-scoped angle artifact."""
+        if channel is None:
+            return ""
+        messages: List[Any] = []
+        try:
+            async for msg in channel.history(limit=limit, before=before, oldest_first=False):
+                messages.append(msg)
+        except Exception as exc:
+            logger.warning("[%s] Failed to fetch Content OS angle context: %s", self.name, exc)
+        messages.reverse()
+        if before is not None:
+            messages.append(before)
+        texts = [getattr(msg, "content", "") or "" for msg in messages]
+        return self._recover_content_os_angle_artifact_from_texts(texts, notion_page_id)
+
+    def _build_content_os_interaction_event(self, interaction, text: str) -> MessageEvent:
+        """Build a MessageEvent for a Discord component interaction."""
+        channel = getattr(interaction, "channel", None)
+        discord_mod = discord if DISCORD_AVAILABLE else None
+        is_dm = bool(discord_mod and isinstance(channel, discord_mod.DMChannel))
+        is_thread = bool(discord_mod and isinstance(channel, discord_mod.Thread))
+        thread_id = str(getattr(channel, "id", "") or getattr(interaction, "channel_id", "") or "") if is_thread else None
+        chat_type = "dm" if is_dm else "thread" if is_thread else "group"
+        if is_dm:
+            chat_name = getattr(getattr(interaction, "user", None), "display_name", "Discord")
+        elif is_thread:
+            chat_name = self._format_thread_chat_name(channel)
+        else:
+            chat_name = getattr(channel, "name", str(getattr(interaction, "channel_id", "")))
+            guild = getattr(channel, "guild", None) or getattr(interaction, "guild", None)
+            if guild:
+                chat_name = f"{guild.name} / #{chat_name}"
+        parent_id = str(getattr(channel, "parent_id", "") or "")
+        channel_id = str(getattr(channel, "id", "") or getattr(interaction, "channel_id", "") or "")
+        user = getattr(interaction, "user", None)
+        guild = getattr(interaction, "guild", None) or getattr(channel, "guild", None)
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=str(getattr(user, "id", "")),
+            user_name=getattr(user, "display_name", "Discord user"),
+            thread_id=thread_id,
+            chat_topic=self._get_effective_topic(channel, is_thread=is_thread) if channel is not None else None,
+            guild_id=str(guild.id) if guild else None,
+            parent_chat_id=parent_id or None,
+            message_id=str(getattr(getattr(interaction, "message", None), "id", "") or ""),
+        )
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=interaction,
+            message_id=str(getattr(getattr(interaction, "message", None), "id", "") or ""),
+            auto_skill=self._resolve_channel_skills(channel_id, parent_id or None),
+            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+        )
+
+    async def _set_content_os_comment_action_buttons(self, message, notion_page_id: str, state: str) -> None:
+        """Replace Content OS comment action buttons with a safe state."""
+        if not DISCORD_AVAILABLE or message is None:
+            return
+        discord_mod = discord
+        if discord_mod is None:
+            return
+        try:
+            view = discord_mod.ui.View(timeout=None)
+            terminal_state = state in {"verifying", "posted", "ignored"}
+            if state == "verifying":
+                comment_label = "Verifying…"
+                comment_style = discord_mod.ButtonStyle.secondary
+            elif state == "posted":
+                comment_label = "Commented"
+                comment_style = discord_mod.ButtonStyle.success
+            else:
+                comment_label = "Comment"
+                comment_style = discord_mod.ButtonStyle.success
+
+            view.add_item(discord_mod.ui.Button(
+                label="Copy Comment",
+                style=discord_mod.ButtonStyle.primary,
+                custom_id=f"contentos_comment:copy:{notion_page_id}",
+                disabled=terminal_state,
+            ))
+            view.add_item(discord_mod.ui.Button(
+                label=comment_label,
+                style=comment_style,
+                custom_id=f"contentos_comment:post:{notion_page_id}",
+                disabled=terminal_state,
+            ))
+            view.add_item(discord_mod.ui.Button(
+                label="Ignore",
+                style=discord_mod.ButtonStyle.secondary,
+                custom_id=f"contentos_comment:ignore:{notion_page_id}",
+                disabled=terminal_state,
+            ))
+            await message.edit(view=view)
+        except Exception as exc:
+            logger.warning("[%s] Failed to update Content OS comment buttons: %s", self.name, exc)
 
     def _parse_content_os_action_json(self, stdout: str) -> dict:
         """Parse JSON emitted by Content OS action scripts, tolerating log lines."""
@@ -4924,6 +5207,21 @@ class DiscordAdapter(BasePlatformAdapter):
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
         event_text = normalized_content
+        manual_angle_match = re.fullmatch(r"\s*([1-5])\s*", event_text or "")
+        if manual_angle_match and is_thread:
+            artifact = await self._fetch_content_os_angle_artifact(
+                message.channel,
+                before=message,
+                notion_page_id="",
+            )
+            if artifact:
+                page_id = self._extract_content_os_notion_page_id_from_artifact(artifact)
+                event_text = self._build_content_os_angle_selection_prompt(
+                    selected_angle=int(manual_angle_match.group(1)),
+                    notion_page_id=page_id or "recovered-from-artifact",
+                    artifact=artifact,
+                    source="manual numeric Discord reply",
+                )
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
 
